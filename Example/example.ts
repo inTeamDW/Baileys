@@ -29,7 +29,7 @@ const startSock = async() => {
 	console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`)
 
 	const sock = makeWASocket({
-		version,
+		//version,
 		logger,
 		printQRInTerminal: true,
 		auth: state,
@@ -67,8 +67,8 @@ const startSock = async() => {
 		const msg = m.messages[0]
 		if(!msg.key.fromMe && m.type === 'notify' && doReplies) {
 			console.log('replying to', m.messages[0].key.remoteJid)
-			await sock!.sendReadReceipt(msg.key.remoteJid, msg.key.participant, [msg.key.id])
-			await sendMessageWTyping({ text: 'Hello there!' }, msg.key.remoteJid)
+			//await sock!.sendReadReceipt(msg.key.remoteJid, msg.key.participant, [msg.key.id])
+			//await sendMessageWTyping({ text: 'Hello there!' }, msg.key.remoteJid)
 		}
 
 	})

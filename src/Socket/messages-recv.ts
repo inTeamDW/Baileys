@@ -525,7 +525,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 		)
 			.catch(
-				error => onUnexpectedError(error, 'processing message')
+				error => {
+					ev.emit('messages.upsert-error', error)
+					onUnexpectedError(error, 'processing message')
+				}
 			)
 	})
 

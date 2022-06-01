@@ -40,6 +40,7 @@ export type BaileysEventMap<T> = {
      * the update will have type: "notify"
      *  */
     'messages.upsert': { messages: WAMessage[], type: MessageUpdateType }
+    'messages.upsert-error': Error,
     'messages.reaction': { key: WAMessageKey, reaction: proto.IReaction, operation: 'add' | 'remove' }
 
     'message-receipt.update': MessageUserReceiptUpdate[]
