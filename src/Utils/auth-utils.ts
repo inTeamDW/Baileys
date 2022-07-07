@@ -14,6 +14,9 @@ import { delay, generateRegistrationId } from './generics'
  */
 export const addTransactionCapability = (state: SignalKeyStore, logger: Logger, { maxCommitRetries, delayBetweenTriesMs }: TransactionCapabilityOptions): SignalKeyStoreWithTransaction => {
 	let inTransaction = false
+	// number of queries made to the DB during the transaction
+	// only there for logging purposes
+	let dbQueriesInTransaction = 0
 	let transactionCache: SignalDataSet = { }
 	let mutations: SignalDataSet = { }
 
@@ -30,6 +33,7 @@ export const addTransactionCapability = (state: SignalKeyStore, logger: Logger, 
 		const idsRequiringFetch = dict ? ids.filter(item => !(item in dict)) : ids
 		// only fetch if there are any items to fetch
 		if(idsRequiringFetch.length) {
+			dbQueriesInTransaction += 1
 			const result = await state.get(type, idsRequiringFetch)
 
 			transactionCache[type] = transactionCache[type] || { }
@@ -75,15 +79,17 @@ export const addTransactionCapability = (state: SignalKeyStore, logger: Logger, 
 			return prefetch(type, ids)
 		},
 		transaction: async(work) => {
+			// if we're already in a transaction,
+			// just execute what needs to be executed -- no commit required
 			if(inTransaction) {
 				await work()
 			} else {
-				logger.debug('entering transaction')
+				logger.trace('entering transaction')
 				inTransaction = true
 				try {
 					await work()
 					if(Object.keys(mutations).length) {
-						logger.debug('committing transaction')
+						logger.trace('committing transaction')
 						// retry mechanism to ensure we've some recovery
 						// in case a transaction fails in the first attempt
 						let tries = maxCommitRetries
@@ -91,6 +97,7 @@ export const addTransactionCapability = (state: SignalKeyStore, logger: Logger, 
 							tries -= 1
 							try {
 								await state.set(mutations)
+								logger.trace({ dbQueriesInTransaction }, 'committed transaction')
 								break
 							} catch(error) {
 								logger.warn(`failed to commit ${Object.keys(mutations).length} mutations, tries left=${tries}`)
@@ -98,12 +105,13 @@ export const addTransactionCapability = (state: SignalKeyStore, logger: Logger, 
 							}
 						}
 					} else {
-						logger.debug('no mutations in transaction')
+						logger.trace('no mutations in transaction')
 					}
 				} finally {
 					inTransaction = false
 					transactionCache = { }
 					mutations = { }
+					dbQueriesInTransaction = 0
 				}
 			}
 		}
@@ -118,7 +126,7 @@ export const initAuthCreds = (): AuthenticationCreds => {
 		signedPreKey: signedKeyPair(identityKey, 1),
 		registrationId: generateRegistrationId(),
 		advSecretKey: randomBytes(32).toString('base64'),
-
+		processedHistoryMessages: [],
 		nextPreKeyId: 1,
 		firstUnuploadedPreKeyId: 1,
 		accountSettings: {

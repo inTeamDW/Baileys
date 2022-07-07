@@ -1,8 +1,10 @@
 import { promisify } from 'util'
 import { inflate } from 'zlib'
 import { proto } from '../../WAProto'
-import { Chat, Contact } from '../Types'
+import { Chat, Contact, InitialReceivedChatsState } from '../Types'
 import { isJidUser } from '../WABinary'
+import { toNumber } from './generics'
+import { normalizeMessageContent } from './messages'
 import { downloadContentFromMessage } from './messages-media'
 
 const inflatePromise = promisify(inflate)
@@ -21,11 +23,15 @@ export const downloadHistory = async(msg: proto.IHistorySyncNotification) => {
 	return syncData
 }
 
-export const processHistoryMessage = (item: proto.IHistorySync, historyCache: Set<string>) => {
-	const isLatest = historyCache.size === 0
+export const processHistoryMessage = (
+	item: proto.IHistorySync,
+	historyCache: Set<string>,
+	recvChats: InitialReceivedChatsState
+) => {
 	const messages: proto.IWebMessageInfo[] = []
 	const contacts: Contact[] = []
 	const chats: Chat[] = []
+
 	switch (item.syncType) {
 	case proto.HistorySync.HistorySyncHistorySyncType.INITIAL_BOOTSTRAP:
 	case proto.HistorySync.HistorySyncHistorySyncType.RECENT:
@@ -36,15 +42,24 @@ export const processHistoryMessage = (item: proto.IHistorySync, historyCache: Se
 				historyCache.add(contactId)
 			}
 
-			for(const { message } of chat.messages || []) {
+			const msgs = chat.messages || []
+			for(const { message } of msgs) {
 				const uqId = `${message.key.remoteJid}:${message.key.id}`
 				if(!historyCache.has(uqId)) {
 					messages.push(message)
+
+					const curItem = recvChats[message.key.remoteJid]
+					const timestamp = toNumber(message.messageTimestamp)
+					if(!message.key.fromMe && (!curItem || timestamp > curItem.lastMsgRecvTimestamp)) {
+						recvChats[message.key.remoteJid] = { lastMsgRecvTimestamp: timestamp }
+						// keep only the most recent message in the chat array
+						chat.messages = [{ message }]
+					}
+
 					historyCache.add(uqId)
 				}
 			}
 
-			delete chat.messages
 			if(!historyCache.has(chat.id)) {
 				if(isJidUser(chat.id) && chat.readOnly && chat.archived) {
 					chat.readOnly = false
@@ -71,15 +86,28 @@ export const processHistoryMessage = (item: proto.IHistorySync, historyCache: Se
 		break
 	}
 
+	const didProcess = !!(chats.length || messages.length || contacts.length)
+
 	return {
 		chats,
 		contacts,
 		messages,
-		isLatest,
+		didProcess,
 	}
 }
 
-export const downloadAndProcessHistorySyncNotification = async(msg: proto.IHistorySyncNotification, historyCache: Set<string>) => {
+export const downloadAndProcessHistorySyncNotification = async(
+	msg: proto.IHistorySyncNotification,
+	historyCache: Set<string>,
+	recvChats: InitialReceivedChatsState
+) => {
 	const historyMsg = await downloadHistory(msg)
-	return processHistoryMessage(historyMsg, historyCache)
+	return processHistoryMessage(historyMsg, historyCache, recvChats)
+}
+
+export const isHistoryMsg = (message: proto.IMessage) => {
+	const normalizedContent = !!message ? normalizeMessageContent(message) : undefined
+	const isAnyHistoryMsg = !!normalizedContent?.protocolMessage?.historySyncNotification
+
+	return isAnyHistoryMsg
 }

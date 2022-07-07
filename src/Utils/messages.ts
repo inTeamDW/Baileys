@@ -17,6 +17,7 @@ import {
 	WAMediaUpload,
 	WAMessage,
 	WAMessageContent,
+	WAMessageKey,
 	WAMessageStatus,
 	WAProto,
 	WATextMessage,
@@ -146,7 +147,7 @@ export const prepareWAMessageMedia = async(
 				encWriteStream,
 				{ fileEncSha256B64, mediaType, timeoutMs: options.mediaUploadTimeoutMs }
 			)
-			logger?.debug('uploaded media')
+			logger?.debug({ mediaType, cacheableKey }, 'uploaded media')
 			return result
 		})(),
 		(async() => {
@@ -263,7 +264,7 @@ export const generateWAMessageContent = async(
 		const extContent = { text: message.text } as WATextMessage
 
 		let urlInfo = message.linkPreview
-		if(!urlInfo) {
+		if(typeof urlInfo === 'undefined') {
 			urlInfo = await generateLinkPreviewIfRequired(message.text, options.getUrlInfo, options.logger)
 		}
 
@@ -291,6 +292,10 @@ export const generateWAMessageContent = async(
 	} else if('location' in message) {
 		m.locationMessage = WAProto.LocationMessage.fromObject(message.location)
 	} else if('react' in message) {
+		if(!message.react.senderTimestampMs) {
+			message.react.senderTimestampMs = Date.now()
+		}
+
 		m.reactionMessage = WAProto.ReactionMessage.fromObject(message.react)
 	} else if('delete' in message) {
 		m.protocolMessage = {
@@ -307,6 +312,23 @@ export const generateWAMessageContent = async(
 			(message.disappearingMessagesInChat ? WA_DEFAULT_EPHEMERAL : 0) :
 			message.disappearingMessagesInChat
 		m = prepareDisappearingMessageSettingContent(exp)
+	} else if('buttonReply' in message) {
+		switch (message.type) {
+		case 'template':
+			m.templateButtonReplyMessage = {
+				selectedDisplayText: message.buttonReply.displayText,
+				selectedId: message.buttonReply.id,
+				selectedIndex: message.buttonReply.index,
+			}
+			break
+		case 'plain':
+			m.buttonsResponseMessage = {
+				selectedButtonId: message.buttonReply.id,
+				selectedDisplayText: message.buttonReply.displayText,
+				type: proto.ButtonsResponseMessage.ButtonsResponseMessageType.DISPLAY_TEXT,
+			}
+			break
+		}
 	} else {
 		m = await prepareWAMessageMedia(
 			message,
@@ -557,7 +579,7 @@ export const getDevice = (id: string) => {
 }
 
 /** Upserts a receipt in the message */
-export const updateMessageWithReceipt = (msg: WAMessage, receipt: MessageUserReceipt) => {
+export const updateMessageWithReceipt = (msg: Pick<WAMessage, 'userReceipt'>, receipt: MessageUserReceipt) => {
 	msg.userReceipt = msg.userReceipt || []
 	const recp = msg.userReceipt.find(m => m.userJid === receipt.userJid)
 	if(recp) {
@@ -565,6 +587,23 @@ export const updateMessageWithReceipt = (msg: WAMessage, receipt: MessageUserRec
 	} else {
 		msg.userReceipt.push(receipt)
 	}
+}
+
+const getKeyAuthor = (key: WAMessageKey | undefined | null) => (
+	(key?.fromMe ? 'me' : key?.participant || key?.remoteJid) || ''
+)
+
+/** Update the message with a new reaction */
+export const updateMessageWithReaction = (msg: Pick<WAMessage, 'reactions'>, reaction: proto.IReaction) => {
+	const authorID = getKeyAuthor(reaction.key)
+
+	const reactions = (msg.reactions || [])
+		.filter(r => getKeyAuthor(r.key) !== authorID)
+	if(reaction.text) {
+		reactions.push(reaction)
+	}
+
+	msg.reactions = reactions
 }
 
 /** Given a list of message keys, aggregates them by chat & sender. Useful for sending read receipts in bulk */
@@ -653,7 +692,7 @@ export const downloadMediaMessage = async(
 
 /** Checks whether the given message is a media message; if it is returns the inner content */
 export const assertMediaContent = (content: proto.IMessage) => {
-	content = normalizeMessageContent(content)
+	content = extractMessageContent(content)
 	const mediaContent = content?.documentMessage
 		|| content?.imageMessage
 		|| content?.videoMessage

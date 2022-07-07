@@ -1,17 +1,17 @@
 import type { Logger } from 'pino'
 import { proto } from '../../WAProto'
-import { AccountSettings, BaileysEventMap, Chat, GroupMetadata, ParticipantAction, SignalKeyStoreWithTransaction, WAMessageStubType } from '../Types'
+import { AuthenticationCreds, BaileysEventEmitter, Chat, GroupMetadata, InitialReceivedChatsState, ParticipantAction, SignalKeyStoreWithTransaction, WAMessageStubType } from '../Types'
 import { downloadAndProcessHistorySyncNotification, normalizeMessageContent, toNumber } from '../Utils'
 import { areJidsSameUser, jidNormalizedUser } from '../WABinary'
 
 type ProcessMessageContext = {
 	historyCache: Set<string>
+	recvChats: InitialReceivedChatsState
 	downloadHistory: boolean
-	meId: string
+	creds: AuthenticationCreds
 	keyStore: SignalKeyStoreWithTransaction
-	accountSettings: AccountSettings
+	ev: BaileysEventEmitter
 	logger?: Logger
-	treatCiphertextMessagesAsReal?: boolean
 }
 
 const MSG_MISSED_CALL_TYPES = new Set([
@@ -23,41 +23,48 @@ const MSG_MISSED_CALL_TYPES = new Set([
 
 /** Cleans a received message to further processing */
 export const cleanMessage = (message: proto.IWebMessageInfo, meId: string) => {
-	// ensure remoteJid doesn't have device or agent in it
+	// ensure remoteJid and participant doesn't have device or agent in it
 	message.key.remoteJid = jidNormalizedUser(message.key.remoteJid!)
+	message.key.participant = message.key.participant ? jidNormalizedUser(message.key.participant!) : undefined
 	const content = normalizeMessageContent(message.message)
 	// if the message has a reaction, ensure fromMe & remoteJid are from our perspective
 	if(content?.reactionMessage) {
 		const msgKey = content.reactionMessage.key!
 		if(!message.key.fromMe) {
-			msgKey.fromMe = areJidsSameUser(msgKey.participant || msgKey.remoteJid, meId)
 			msgKey.remoteJid = message.key.remoteJid
+			msgKey.fromMe = areJidsSameUser(msgKey.participant || msgKey.remoteJid, meId)
 			msgKey.participant = msgKey.participant || message.key.participant
 		}
 	}
 }
 
+export const isRealMessage = (message: proto.IWebMessageInfo) => {
+	const normalizedContent = normalizeMessageContent(message.message)
+	return (
+		!!normalizedContent
+		|| MSG_MISSED_CALL_TYPES.has(message.messageStubType)
+	)
+	&& !normalizedContent?.protocolMessage
+	&& !normalizedContent?.reactionMessage
+}
+
+export const shouldIncrementChatUnread = (message: proto.IWebMessageInfo) => (
+	!message.key.fromMe && !message.messageStubType
+)
+
 const processMessage = async(
 	message: proto.IWebMessageInfo,
-	{ downloadHistory, historyCache, meId, keyStore, accountSettings, logger, treatCiphertextMessagesAsReal }: ProcessMessageContext
+	{ downloadHistory, ev, historyCache, recvChats, creds, keyStore, logger }: ProcessMessageContext
 ) => {
-	const map: Partial<BaileysEventMap<any>> = { }
+	const meId = creds.me!.id
+	const { accountSettings } = creds
 
 	const chat: Partial<Chat> = { id: jidNormalizedUser(message.key.remoteJid) }
 
-	const normalizedContent = !!message.message && normalizeMessageContent(message.message)
-	if(
-		(
-			!!normalizedContent
-			|| MSG_MISSED_CALL_TYPES.has(message.messageStubType)
-			|| (message.messageStubType === WAMessageStubType.CIPHERTEXT && treatCiphertextMessagesAsReal)
-		)
-		&& !normalizedContent?.protocolMessage
-		&& !normalizedContent?.reactionMessage
-	) {
+	if(isRealMessage(message)) {
 		chat.conversationTimestamp = toNumber(message.messageTimestamp)
 		// only increment unread count if not CIPHERTEXT and from another person
-		if(!message.key.fromMe && !message.messageStubType) {
+		if(shouldIncrementChatUnread(message)) {
 			chat.unreadCount = (chat.unreadCount || 0) + 1
 		}
 
@@ -77,18 +84,28 @@ const processMessage = async(
 			logger?.info({ histNotification, id: message.key.id }, 'got history notification')
 
 			if(downloadHistory) {
-				const { chats, contacts, messages, isLatest } = await downloadAndProcessHistorySyncNotification(histNotification, historyCache)
+				const { chats, contacts, messages, didProcess } = await downloadAndProcessHistorySyncNotification(histNotification, historyCache, recvChats)
+				const isLatest = historyCache.size === 0 && !creds.processedHistoryMessages?.length
 
 				if(chats.length) {
-					map['chats.set'] = { chats, isLatest }
+					ev.emit('chats.set', { chats, isLatest })
 				}
 
 				if(messages.length) {
-					map['messages.set'] = { messages, isLatest }
+					ev.emit('messages.set', { messages, isLatest })
 				}
 
 				if(contacts.length) {
-					map['contacts.set'] = { contacts }
+					ev.emit('contacts.set', { contacts, isLatest })
+				}
+
+				if(didProcess) {
+					ev.emit('creds.update', {
+						processedHistoryMessages: [
+							...(creds.processedHistoryMessages || []),
+							{ key: message.key, messageTimestamp: message.messageTimestamp }
+						]
+					})
 				}
 			}
 
@@ -110,14 +127,14 @@ const processMessage = async(
 					}
 				)
 
-				map['creds.update'] = { myAppStateKeyId: newAppStateSyncKeyId }
+				ev.emit('creds.update', { myAppStateKeyId: newAppStateSyncKeyId })
 			} else {
 				logger?.info({ protocolMsg }, 'recv app state sync with 0 keys')
 			}
 
 			break
 		case proto.ProtocolMessage.ProtocolMessageType.REVOKE:
-			map['messages.update'] = [
+			ev.emit('messages.update', [
 				{
 					key: {
 						...message.key,
@@ -125,7 +142,7 @@ const processMessage = async(
 					},
 					update: { message: null, messageStubType: WAMessageStubType.REVOKE, key: message.key }
 				}
-			]
+			])
 			break
 		case proto.ProtocolMessage.ProtocolMessageType.EPHEMERAL_SETTING:
 			Object.assign(chat, {
@@ -139,21 +156,19 @@ const processMessage = async(
 			...content.reactionMessage,
 			key: message.key,
 		}
-		const operation = content.reactionMessage?.text ? 'add' : 'remove'
-		map['messages.reaction'] = {
+		ev.emit('messages.reaction', [{
 			reaction,
 			key: content.reactionMessage!.key!,
-			operation
-		}
+		}])
 	} else if(message.messageStubType) {
 		const jid = message.key!.remoteJid!
 		//let actor = whatsappID (message.participant)
 		let participants: string[]
 		const emitParticipantsUpdate = (action: ParticipantAction) => (
-			map['group-participants.update'] = { id: jid, participants, action }
+			ev.emit('group-participants.update', { id: jid, participants, action })
 		)
 		const emitGroupUpdate = (update: Partial<GroupMetadata>) => {
-			map['groups.update'] = [ { id: jid, ...update } ]
+			ev.emit('groups.update', [{ id: jid, ...update }])
 		}
 
 		const participantsIncludesMe = () => participants.find(jid => areJidsSameUser(meId, jid))
@@ -204,10 +219,8 @@ const processMessage = async(
 	}
 
 	if(Object.keys(chat).length > 1) {
-		map['chats.update'] = [chat]
+		ev.emit('chats.update', [chat])
 	}
-
-	return map
 }
 
 export default processMessage

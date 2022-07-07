@@ -86,7 +86,7 @@ export const encodeBigEndian = (e: number, t = 4) => {
 	return a
 }
 
-export const toNumber = (t: Long | number) => ((typeof t === 'object' && t) ? ('toNumber' in t ? t.toNumber() : (t as any).low) : t)
+export const toNumber = (t: Long | number): number => ((typeof t === 'object' && t) ? ('toNumber' in t ? t.toNumber() : (t as any).low) : t)
 
 export function shallowChanges <T>(old: T, current: T, { lookForDeletedKeys }: {lookForDeletedKeys: boolean}): Partial<T> {
 	const changes: Partial<T> = {}
@@ -254,6 +254,27 @@ export const fetchLatestBaileysVersion = async() => {
 	}
 }
 
+/**
+ * A utility that fetches the latest web version of whatsapp.
+ * Use to ensure your WA connection is always on the latest version
+ */
+export const fetchLatestWaWebVersion = async() => {
+	try {
+		const result = await axios.get('https://web.whatsapp.com/check-update?version=1&platform=web', { responseType: 'json' })
+		const version = result.data.currentVersion.split('.')
+		return {
+			version: [+version[0], +version[1], +version[2]] as WAVersion,
+			isLatest: true
+		}
+	} catch(error) {
+		return {
+			version: baileysVersion as WAVersion,
+			isLatest: false,
+			error
+		}
+	}
+}
+
 /** unique message tag prefix for MD clients */
 export const generateMdTagPrefix = () => {
 	const bytes = randomBytes(4)
@@ -328,4 +349,20 @@ export const getCallStatusFromNode = ({ tag, attrs }: BinaryNode) => {
 	}
 
 	return status
+}
+
+const UNEXPECTED_SERVER_CODE_TEXT = 'Unexpected server response: '
+
+export const getCodeFromWSError = (error: Error) => {
+	let statusCode = 500
+	if(error.message.includes(UNEXPECTED_SERVER_CODE_TEXT)) {
+		const code = +error.message.slice(UNEXPECTED_SERVER_CODE_TEXT.length)
+		if(!Number.isNaN(code) && code >= 400) {
+			statusCode = code
+		}
+	} else if((error as any).code?.startsWith('E')) { // handle ETIMEOUT, ENOTFOUND etc
+		statusCode = 408
+	}
+
+	return statusCode
 }
